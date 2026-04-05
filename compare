@@ -1,0 +1,178 @@
+<#
+.SYNOPSIS
+    Compares two exported .reg files for a given registry hive/path.
+.DESCRIPTION
+    Parses both .reg files, extracts all keys and values under the specified
+    hive path, and reports additions, removals, and value changes.
+.PARAMETER BaselineFile
+    Path to the baseline (before) .reg file.
+.PARAMETER CompareFile
+    Path to the comparison (after) .reg file.
+.PARAMETER HivePath
+    Registry path to filter on, e.g. HKEY_LOCAL_MACHINE\SYSTEM
+.EXAMPLE
+    .\Compare-RegFiles.ps1 -BaselineFile before.reg -CompareFile after.reg -HivePath "HKEY_LOCAL_MACHINE\SYSTEM"
+#>
+
+param(
+    [Parameter(Mandatory)][string]$BaselineFile,
+    [Parameter(Mandatory)][string]$CompareFile,
+    [Parameter(Mandatory)][string]$HivePath
+)
+
+function Parse-RegFile {
+    param([string]$Path)
+
+    $content = Get-Content -Path $Path -Raw
+    $entries = @{}
+    $currentKey = $null
+
+    foreach ($rawLine in $content -split "`r?`n") {
+        $line = $rawLine.TrimEnd()
+
+        # Skip blanks, comments, header
+        if ($line -eq '' -or $line.StartsWith(';') -or $line -match '^Windows Registry Editor') {
+            continue
+        }
+
+        # Key header: [HKEY_...]
+        if ($line -match '^\[(-?)(.+)\]$') {
+            $deleted = $Matches[1] -eq '-'
+            $currentKey = $Matches[2]
+            if (-not $deleted -and $currentKey -like "$HivePath*") {
+                if (-not $entries.ContainsKey($currentKey)) {
+                    $entries[$currentKey] = @{}
+                }
+            } else {
+                $currentKey = $null
+            }
+            continue
+        }
+
+        # Value line under a matched key
+        if ($null -ne $currentKey -and $currentKey -like "$HivePath*") {
+            # Handle line continuations (trailing backslash)
+            $fullLine = $line
+            # This simple parser assumes exported files don't split lines;
+            # for multi-line hex values, they get concatenated on re-read anyway.
+
+            if ($fullLine -match '^(".*?"|@)\s*=\s*(.*)$') {
+                $valueName = $Matches[1].Trim('"')
+                if ($Matches[1] -eq '@') { $valueName = '(Default)' }
+                $valueData = $Matches[2]
+                $entries[$currentKey][$valueName] = $valueData
+            }
+        }
+    }
+
+    return $entries
+}
+
+# --- Main ---
+
+if (-not (Test-Path $BaselineFile)) { Write-Error "Baseline file not found: $BaselineFile"; exit 1 }
+if (-not (Test-Path $CompareFile))  { Write-Error "Compare file not found: $CompareFile"; exit 1 }
+
+# Normalize short hive names to full names
+$hiveMap = @{
+    'HKLM'  = 'HKEY_LOCAL_MACHINE'
+    'HKCU'  = 'HKEY_CURRENT_USER'
+    'HKCR'  = 'HKEY_CLASSES_ROOT'
+    'HKU'   = 'HKEY_USERS'
+    'HKCC'  = 'HKEY_CURRENT_CONFIG'
+}
+foreach ($short in $hiveMap.Keys) {
+    if ($HivePath -like "$short\*" -or $HivePath -eq $short) {
+        $HivePath = $HivePath -replace "^$short", $hiveMap[$short]
+        break
+    }
+}
+
+Write-Host "`n=== Parsing files ===" -ForegroundColor Cyan
+$baseline = Parse-RegFile -Path $BaselineFile
+$compare  = Parse-RegFile -Path $CompareFile
+Write-Host "Baseline: $($baseline.Count) keys | Compare: $($compare.Count) keys"
+
+# --- Diff keys ---
+
+$allKeys = @($baseline.Keys) + @($compare.Keys) | Sort-Object -Unique
+
+$addedKeys   = @()
+$removedKeys = @()
+$changedKeys = @()
+
+foreach ($key in $allKeys) {
+    $inBase = $baseline.ContainsKey($key)
+    $inComp = $compare.ContainsKey($key)
+
+    if ($inComp -and -not $inBase) {
+        $addedKeys += $key
+    }
+    elseif ($inBase -and -not $inComp) {
+        $removedKeys += $key
+    }
+    elseif ($inBase -and $inComp) {
+        # Compare values within the key
+        $baseVals = $baseline[$key]
+        $compVals = $compare[$key]
+        $allNames = @($baseVals.Keys) + @($compVals.Keys) | Sort-Object -Unique
+
+        $keyDiffs = @()
+        foreach ($name in $allNames) {
+            $inBV = $baseVals.ContainsKey($name)
+            $inCV = $compVals.ContainsKey($name)
+
+            if ($inCV -and -not $inBV) {
+                $keyDiffs += [PSCustomObject]@{ Change='Added'; Name=$name; Baseline=$null; Compare=$compVals[$name] }
+            }
+            elseif ($inBV -and -not $inCV) {
+                $keyDiffs += [PSCustomObject]@{ Change='Removed'; Name=$name; Baseline=$baseVals[$name]; Compare=$null }
+            }
+            elseif ($baseVals[$name] -ne $compVals[$name]) {
+                $keyDiffs += [PSCustomObject]@{ Change='Modified'; Name=$name; Baseline=$baseVals[$name]; Compare=$compVals[$name] }
+            }
+        }
+
+        if ($keyDiffs.Count -gt 0) {
+            $changedKeys += [PSCustomObject]@{ Key=$key; Diffs=$keyDiffs }
+        }
+    }
+}
+
+# --- Output ---
+
+Write-Host "`n=== ADDED KEYS ($($addedKeys.Count)) ===" -ForegroundColor Green
+foreach ($k in $addedKeys) {
+    Write-Host "  + $k" -ForegroundColor Green
+    foreach ($v in $compare[$k].GetEnumerator()) {
+        Write-Host "      $($v.Key) = $($v.Value)" -ForegroundColor DarkGreen
+    }
+}
+
+Write-Host "`n=== REMOVED KEYS ($($removedKeys.Count)) ===" -ForegroundColor Red
+foreach ($k in $removedKeys) {
+    Write-Host "  - $k" -ForegroundColor Red
+}
+
+Write-Host "`n=== MODIFIED KEYS ($($changedKeys.Count)) ===" -ForegroundColor Yellow
+foreach ($entry in $changedKeys) {
+    Write-Host "  ~ $($entry.Key)" -ForegroundColor Yellow
+    foreach ($d in $entry.Diffs) {
+        switch ($d.Change) {
+            'Added'    { Write-Host "      + [$($d.Name)] = $($d.Compare)" -ForegroundColor Green }
+            'Removed'  { Write-Host "      - [$($d.Name)] = $($d.Baseline)" -ForegroundColor Red }
+            'Modified' {
+                Write-Host "      ~ [$($d.Name)]" -ForegroundColor Yellow
+                Write-Host "          was: $($d.Baseline)" -ForegroundColor DarkYellow
+                Write-Host "          now: $($d.Compare)" -ForegroundColor DarkYellow
+            }
+        }
+    }
+}
+
+$totalChanges = $addedKeys.Count + $removedKeys.Count + $changedKeys.Count
+if ($totalChanges -eq 0) {
+    Write-Host "`nNo differences found under $HivePath" -ForegroundColor Green
+} else {
+    Write-Host "`nTotal: $($addedKeys.Count) added, $($removedKeys.Count) removed, $($changedKeys.Count) modified keys" -ForegroundColor Cyan
+}
